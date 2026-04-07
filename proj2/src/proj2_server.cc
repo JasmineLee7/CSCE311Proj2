@@ -1,192 +1,236 @@
-// This is your file.
-//
+// proj2_server.cc
 #include <proj2/lib/domain_socket.h>
 #include <proj2/lib/file_reader.h>
 #include <proj2/lib/thread_log.h>
-#include <proj2/lib/timings.h>
 #include <proj2/lib/sha_solver.h>
-#include <sys/sysinfo.h>
+
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
+#include <sys/sysinfo.h>
 
 #include <cstring>
-#include <string>
-#include <queue>
-#include <vector>
 #include <cstdint>
-#include <algorithm>
+#include <string>
+#include <vector>
+#include <queue>
+#include <iostream>
 
-// Forward declarations so main can see these before their definitions
-void *StartRoutine(void*);
-void ParseMessage(const std::string& msg,
-                  std::string* client_addr,
-                  std::vector<std::string>* file_paths,
-                  std::vector<std::uint32_t>* rows_per_file);
-void SignalHandler(int);
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
 
-// Globals shared between main (producer) and worker threads (consumers)
-std::queue<std::string> msg_queue;
-sem_t msg_semaphore;          // counts how many messages are waiting
-pthread_mutex_t mtx;          // protects msg_queue
-volatile sig_atomic_t signal_status = 0;  // set by signal handler to request shutdown
+// Message queue shared between the main receiver loop and worker threads
+static std::queue<std::string> msg_queue;
+static pthread_mutex_t queue_mtx;
+static sem_t queue_sem;
 
-void SignalHandler(int) {
-    // Only async-signal-safe operations allowed here.
-    // Setting a sig_atomic_t flag is safe; everything else is not.
-    signal_status = 1;
+// The bound datagram endpoint — workers need it to connect back to clients
+static proj2::UnixDomainDatagramEndpoint* g_endpoint = nullptr;
+
+// Set to 1 by signal handler; workers check this to exit cleanly
+static volatile sig_atomic_t g_stop = 0;
+
+// ---------------------------------------------------------------------------
+// Signal handler — only sets the flag, nothing else (async-signal-safe)
+// ---------------------------------------------------------------------------
+static void SignalHandler(int) {
+    g_stop = 1;
 }
 
-int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        ThreadErr("Usage: %s <socket_path> <num_threads> <num_solvers>\n", argv[0]);
-        return 1;
-    }
-
-    // Install signal handlers before anything else so no signal is missed
-    signal(SIGINT,  SignalHandler);
-    signal(SIGTERM, SignalHandler);
-
-    sem_init(&msg_semaphore, 0, 0);   // starts at 0; incremented each time a message arrives
-    pthread_mutex_init(&mtx, nullptr);
-
-    std::string socket_path = argv[1];
-    int num_threads = std::stoi(argv[2]);
-    int num_solvers = std::stoi(argv[3]);
-
-    // Init resource pools before threads start so Checkout calls work immediately.
-    // Solvers: use the count passed on the command line.
-    // Readers: one per thread is a reasonable bound — each thread needs at most one reader set.
-    proj2::ShaSolvers::Init(num_solvers);
-    proj2::FileReaders::Init(num_threads);
-
-    // Bind the datagram endpoint so the socket exists before threads or clients run
-    proj2::UnixDomainDatagramEndpoint endpoint(socket_path);
-    endpoint.Init();
-
-    // Spawn worker threads. They block on sem_wait until messages arrive.
-    std::vector<pthread_t> threads(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
-        pthread_create(&threads[i], nullptr, StartRoutine, nullptr);
-    }
-
-    // Main loop: receive datagrams and enqueue them for workers.
-    // RecvFrom gives us the sender path (we don't need it here; client embeds reply addr in payload).
-    for (;;) {
-        if (signal_status) break;
-        std::string sender_path;
-        std::string msg = endpoint.RecvFrom(&sender_path, 65000);
-        pthread_mutex_lock(&mtx);
-        msg_queue.push(msg);
-        pthread_mutex_unlock(&mtx);
-        sem_post(&msg_semaphore);  // wake one worker
-    }
-
-    // Signal all sleeping workers to wake and check signal_status so they exit
-    for (int i = 0; i < num_threads; ++i)
-        sem_post(&msg_semaphore);
-
-    for (int i = 0; i < num_threads; ++i)
-        pthread_join(threads[i], nullptr);
-
-    pthread_mutex_destroy(&mtx);
-    sem_destroy(&msg_semaphore);
-
-    return 0;
-}
-
-void ParseMessage(const std::string& msg,
-                  std::string* client_addr,
-                  std::vector<std::string>* file_paths,
-                  std::vector<std::uint32_t>* rows_per_file) {
-    // Walk the binary payload byte by byte using an offset n.
-    // All integers are 4-byte uint32_t in host byte order (per the spec).
-    // Strings are NOT null terminated — length always comes first.
-
+// ---------------------------------------------------------------------------
+// ParseMessage
+//   Parses the binary datagram described in the spec:
+//     uint32_t  reply_path_len
+//     char[]    reply_path          (reply_path_len bytes, not null-terminated)
+//     uint32_t  file_count
+//     for each file:
+//       uint32_t  path_len
+//       char[]    path              (path_len bytes)
+//       uint32_t  row_count
+// ---------------------------------------------------------------------------
+static void ParseMessage(const std::string& msg,
+                         std::string* client_addr,
+                         std::vector<std::string>* file_paths,
+                         std::vector<std::uint32_t>* rows_per_file) {
+    const char* p = msg.data();
     int n = 0;
-    const char* c_ptr = msg.data();
     std::uint32_t int_value;
 
-    // Read reply endpoint length, then the string itself
-    std::memcpy(&int_value, c_ptr + n, 4);
+    // --- reply endpoint ---
+    std::memcpy(&int_value, p + n, 4);
     n += 4;
-    client_addr->assign(c_ptr + n, int_value);
+    client_addr->assign(p + n, int_value);
     n += int_value;
 
-    // Read file count — tells us how many (path, row_count) pairs follow
-    std::uint32_t file_count;
-    std::memcpy(&file_count, c_ptr + n, 4);
+    // --- file count ---
+    std::memcpy(&int_value, p + n, 4);
     n += 4;
+    std::uint32_t file_count = int_value;
 
-    // Read each file entry: path length, path string, row count
+    // --- per-file fields ---
     for (std::uint32_t i = 0; i < file_count; ++i) {
-        std::memcpy(&int_value, c_ptr + n, 4);  // path length
+        // path length + path
+        std::memcpy(&int_value, p + n, 4);
         n += 4;
-        file_paths->push_back(std::string(c_ptr + n, int_value));  // path string
+        std::string path(p + n, int_value);
         n += int_value;
+        file_paths->push_back(path);
 
-        std::uint32_t row_count;
-        std::memcpy(&row_count, c_ptr + n, 4);  // row count for this file
+        // row count
+        std::memcpy(&int_value, p + n, 4);
         n += 4;
-        rows_per_file->push_back(row_count);
+        rows_per_file->push_back(int_value);
     }
 }
 
-void *StartRoutine(void*) {
+// ---------------------------------------------------------------------------
+// Worker thread routine
+//   Each thread:
+//     1. Waits on the semaphore for a message
+//     2. Pops the message under the mutex
+//     3. Parses it
+//     4. Checks out solvers FIRST (deadlock prevention — consistent ordering)
+//     5. Checks out readers (holding solvers already)
+//     6. Calls ReaderHandle::Process to get hashes
+//     7. Checks in readers, then solvers
+//     8. Connects back to client via stream socket and sends all hashes
+// ---------------------------------------------------------------------------
+static void* WorkerRoutine(void*) {
     for (;;) {
-        if (signal_status) break;
+        // Wait for work; sem_wait may return EINTR — loop until we get it
+        while (sem_wait(&queue_sem) != 0) { /* retry on EINTR */ }
 
-        sem_wait(&msg_semaphore);  // block until a message is available
+        // Check termination flag after waking
+        if (g_stop) break;
 
-        if (signal_status) break;  // re-check after waking; could be shutdown sem_post
-
-        pthread_mutex_lock(&mtx);
+        // Pop one message from the queue
+        pthread_mutex_lock(&queue_mtx);
         std::string msg = msg_queue.front();
         msg_queue.pop();
-        pthread_mutex_unlock(&mtx);
+        pthread_mutex_unlock(&queue_mtx);
 
+        // Parse the binary message
         std::string client_addr;
         std::vector<std::string> file_paths;
         std::vector<std::uint32_t> rows_per_file;
         ParseMessage(msg, &client_addr, &file_paths, &rows_per_file);
 
-        // --- Resource acquisition: solvers first, then readers (prevents deadlock) ---
+        std::uint32_t file_count = file_paths.size();
 
-        // Find the largest row count across all files.
-        // That is how many solvers we need: the reader for the biggest file
-        // will dispatch that many SHA computations in parallel.
-        std::uint32_t max_rows = *std::max_element(rows_per_file.begin(), rows_per_file.end());
+        // Determine how many solvers and readers to request.
+        // The spec says rows_per_file[i] is the number of rows (seeds) per
+        // file, and we need one solver per row across all files (or at least
+        // one per file). We request one solver per file as the parallelism
+        // unit since each ReaderHandle uses its solver set per file.
+        // We checkout solvers FIRST to enforce consistent lock ordering and
+        // prevent deadlock.
+        std::uint32_t num_solvers = (file_count > 0) ? file_count : 1;
+        std::uint32_t num_readers = file_count;
 
-        // 1. Checkout solvers first — blocks if not enough are free
-        proj2::SolverHandle solver = proj2::ShaSolvers::Checkout(max_rows);
+        // --- Checkout solvers first (deadlock prevention) ---
+        proj2::SolverHandle solver = proj2::ShaSolvers::Checkout(num_solvers);
 
-        // 2. Checkout readers second — blocks if not enough are free
-        //    We need one reader slot per file
-        std::uint32_t num_files = static_cast<std::uint32_t>(file_paths.size());
-        proj2::ReaderHandle reader = proj2::FileReaders::Checkout(num_files, &solver);
+        // --- Then checkout readers ---
+        proj2::ReaderHandle reader = proj2::FileReaders::Checkout(num_readers, &solver);
 
-        // --- Do the work ---
-
-        // Process all files; result is a 2D vector: one inner vector of hashes per file
-        std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes;
+        // --- Process files into hashes ---
+        // Library requires file_hashes to be pre-sized to num_files
+        std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes(file_count);
         reader.Process(file_paths, rows_per_file, &file_hashes);
 
-        // Flatten: concatenate all per-file hash vectors in file order into one buffer.
-        // Each hash is exactly 64 ASCII bytes (no null terminator).
-        std::string response;
-        for (auto& hashes : file_hashes)
-            for (auto& h : hashes)
-                response.append(h.data(), 64);
-
-        // --- Release resources: readers first, then solvers (reverse of acquisition) ---
+        // --- Release resources in reverse order (readers first, then solvers) ---
         proj2::FileReaders::Checkin(std::move(reader));
         proj2::ShaSolvers::Checkin(std::move(solver));
 
-        // --- Send result back to client via stream socket ---
-        proj2::UnixDomainStreamClient stream(client_addr);
-        stream.Init();  // connect to client's listening stream endpoint
-        stream.Write(response.data(), response.size());
+        // --- Concatenate all hashes in file order ---
+        std::string result;
+        for (std::uint32_t i = 0; i < file_count; ++i) {
+            for (const auto& hash : file_hashes[i]) {
+                result.append(hash.data(), 64);
+            }
+        }
+
+        // --- Connect back to the client via a stream socket and send result ---
+        proj2::UnixDomainStreamClient stream_client(client_addr);
+        stream_client.Init();  // connect
+        stream_client.Write(result.data(), result.size());
     }
 
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// main
+//   argv[1] = socket path
+//   argv[2] = number of file reader threads
+//   argv[3] = log file (unused beyond satisfying the interface)
+// ---------------------------------------------------------------------------
+int main(int argc, char* argv[]) {
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <socket_path> <num_threads> <log_file>" << std::endl;
+        return 1;
+    }
+
+    std::string socket_path = argv[1];
+    int num_threads = std::stoi(argv[2]);
+
+    // Install signal handlers before anything else
+    signal(SIGINT,  SignalHandler);
+    signal(SIGTERM, SignalHandler);
+
+    // Initialize synchronization primitives
+    pthread_mutex_init(&queue_mtx, nullptr);
+    sem_init(&queue_sem, 0, 0);
+
+    // Get the number of CPU cores for solver pool sizing
+    int num_cores = get_nprocs();
+
+    // Initialize resource pools
+    // ShaSolvers: one pool sized to the number of CPU cores
+    proj2::ShaSolvers::Init(num_cores);
+    // FileReaders: sized to the requested number of threads
+    proj2::FileReaders::Init(num_threads);
+
+    // Bind the datagram endpoint
+    proj2::UnixDomainDatagramEndpoint endpoint(socket_path);
+    endpoint.Init();
+    g_endpoint = &endpoint;
+
+    // Spawn worker threads
+    std::vector<pthread_t> threads(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        pthread_create(&threads[i], nullptr, WorkerRoutine, nullptr);
+    }
+
+    // Main receive loop: block waiting for datagrams, push to queue
+    for (;;) {
+        if (g_stop) break;
+
+        std::string peer;
+        // RecvFrom blocks; returns the raw datagram bytes
+        std::string msg = endpoint.RecvFrom(&peer, 65000);
+
+        pthread_mutex_lock(&queue_mtx);
+        msg_queue.push(msg);
+        pthread_mutex_unlock(&queue_mtx);
+        sem_post(&queue_sem);
+    }
+
+    // Wake all threads so they see g_stop and exit
+    for (int i = 0; i < num_threads; ++i) {
+        sem_post(&queue_sem);
+    }
+
+    // Join all threads
+    for (int i = 0; i < num_threads; ++i) {
+        pthread_join(threads[i], nullptr);
+    }
+
+    // Clean up
+    pthread_mutex_destroy(&queue_mtx);
+    sem_destroy(&queue_sem);
+
+    return 0;
 }
