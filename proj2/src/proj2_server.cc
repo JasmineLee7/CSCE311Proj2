@@ -55,10 +55,9 @@ int main(int argc, char* argv[]) {
 
     std::string socket_path = argv[1];
     int num_threads = std::stoi(argv[2]);
-    int num_solvers = std::stoi(argv[3]);
 
-    // init pools before threads start
-    proj2::ShaSolvers::Init(num_solvers);
+    // use total CPU count so the pool can satisfy any single request
+    proj2::ShaSolvers::Init(get_nprocs());
     proj2::FileReaders::Init(num_threads);
 
     // bind socket before threads start
