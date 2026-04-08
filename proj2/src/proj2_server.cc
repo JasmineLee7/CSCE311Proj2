@@ -148,7 +148,7 @@ void* StartRoutine(void*) {
         proj2::ReaderHandle reader = proj2::FileReaders::Checkout(req.num_readers, &solver);
 
         // process files into hashes
-        std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes;
+        std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes(req.num_readers);
         reader.Process(req.file_paths, req.rows_per_file, &file_hashes);
 
         // flatten all hashes into one response string, in file order
