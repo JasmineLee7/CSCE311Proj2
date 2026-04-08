@@ -1,5 +1,3 @@
-// This is your file.
-//
 #include <proj2/lib/domain_socket.h>
 #include <proj2/lib/file_reader.h>
 #include <proj2/lib/thread_log.h>
@@ -36,7 +34,6 @@ void* StartRoutine(void*);
 Request ParseMessage(const std::string& msg);
 
 void SignalHandler(int) {
-    // only async-signal-safe operations here
     signal_status = 1;
 }
 
@@ -63,7 +60,7 @@ int main(int argc, char* argv[]) {
     proj2::UnixDomainDatagramEndpoint endpoint(socket_path);
     endpoint.Init();
 
-    // spawn worker threads — they block on msg_semaphore until work arrives
+    // spawn worker threads, they block on msg_semaphore until work arrives
     std::vector<pthread_t> threads(num_threads);
     for (int i = 0; i < num_threads; ++i)
         pthread_create(&threads[i], nullptr, StartRoutine, nullptr);
@@ -143,7 +140,7 @@ void* StartRoutine(void*) {
         msg_queue.pop();
         pthread_mutex_unlock(&mtx); // unlock after accessing message queue
 
-        // acquire solvers first, then readers — consistent ordering prevents deadlock
+        // acquire solvers first, then readers, consistent ordering prevents deadlock
         proj2::SolverHandle solver = proj2::ShaSolvers::Checkout(req.num_solvers);
         proj2::ReaderHandle reader = proj2::FileReaders::Checkout(req.num_readers, &solver);
 
@@ -151,17 +148,15 @@ void* StartRoutine(void*) {
         std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes(req.num_readers);
         reader.Process(req.file_paths, req.rows_per_file, &file_hashes);
 
-        // flatten all hashes into one response string, in file order
         std::string response;
         for (auto& hashes : file_hashes)
             for (auto& h : hashes)
                 response.append(h.data(), 64);
 
-        // release in reverse order — readers first, then solvers
+        // release in reverse order, readers then solvers
         proj2::FileReaders::Checkin(std::move(reader));
         proj2::ShaSolvers::Checkin(std::move(solver));
 
-        // connect back to client and stream the result
         proj2::UnixDomainStreamClient stream(req.client_addr);
         stream.Init();
         stream.Write(response.data(), response.size());
