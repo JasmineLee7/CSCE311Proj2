@@ -11,7 +11,7 @@ fi
 MAX_ITS=${1:-1000}
 CLIENTS_PER_SEC=${2:-50}
 CLIENT_PREFIX="${3:-client_endpoint}"
-DATAGRAM_HOST="${4:-datagram_host}"
+DATAGRAM_HOST="${4:-/tmp/my_socket}"
 
 # Global Consts
 CLIENT="bin/proj2-client"
